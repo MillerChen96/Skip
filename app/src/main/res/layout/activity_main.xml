@@ -245,7 +245,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="1. 点击\"打开无障碍服务\"，在列表中找到\"跳广告助手\"并开启\n\n2. 返回应用，点击\"启动服务\"\n\n3. 建议将应用加入电池优化白名单，防止被系统杀死\n\n4. 本应用不联网，保护您的隐私安全"
+                    android:text="@string/instructions"
                     android:textSize="12sp"
                     android:textColor="@color/gray" />
 
