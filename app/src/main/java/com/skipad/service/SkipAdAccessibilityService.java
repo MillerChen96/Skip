@@ -9,84 +9,73 @@ import android.graphics.Rect;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.preference.PreferenceManager;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
-import com.skipad.util.SkipAdPreferences;
-
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
  * 跳过广告的无障碍服务
  * 自动检测并点击跳过按钮
+ * 
+ * 关键改进：
+ * 1. 只在应用启动时检测（窗口切换）
+ * 2. 每个应用每次启动只检测一次
+ * 3. 更严格的跳过按钮判断
  */
 public class SkipAdAccessibilityService extends AccessibilityService {
 
     private static final String TAG = "SkipAdService";
     
-    // 跳过按钮的常见文本关键词
-    private static final String[] SKIP_KEYWORDS = {
-        "跳过", "关闭", "跳过广告", "关闭广告", "关闭按钮",
+    // 精确匹配的跳过按钮文本（必须完全匹配或非常接近）
+    private static final String[] EXACT_SKIP_TEXTS = {
+        "跳过", "关闭", "跳过广告", "关闭广告",
         "skip", "close", "skip ad", "close ad", "dismiss",
-        "跳过 >", "跳过>", "> 跳过", ">跳过",
-        "×", "X", "x", "跳过  ", "  跳过",
-        "立即跳过", "点击跳过", "点击关闭",
-        "广告跳过", "跳过此广告", "跳过视频",
-        "跳过 splash", "跳过开屏", "跳过启动页",
-        "3秒后跳过", "5秒后跳过", "倒计时跳过",
-        "跳过 •", "• 跳过", "跳过·", "·跳过"
+        "立即跳过", "点击跳过", "跳过此广告", "跳过视频",
+        "跳过开屏", "跳过启动页"
     };
     
-    // 跳过按钮的常见ID关键词
+    // 包含倒计时的跳过文本模式（如 "3秒后跳过", "5s" 等）
+    private static final Pattern COUNTDOWN_PATTERN = Pattern.compile(
+        "(\\d+\\s*[秒s].*跳过|跳过.*\\d+\\s*[秒s]|倒计时.*跳过|跳过.*倒计时)",
+        Pattern.CASE_INSENSITIVE
+    );
+    
+    // 跳过按钮的常见ID关键词（更严格）
     private static final String[] SKIP_ID_KEYWORDS = {
-        "skip", "close", "jump", "dismiss", "cancel",
-        "ad_skip", "ad_close", "skip_ad", "close_ad",
-        "btn_skip", "btn_close", "tv_skip", "tv_close",
-        "iv_skip", "iv_close", "img_skip", "img_close",
-        "skip_button", "close_button", "jump_button",
-        "splash_skip", "splash_close", "launch_skip",
-        "skip_text", "close_text", "jump_text"
+        "splash_skip", "splash_close", "ad_skip", "ad_close",
+        "skip_ad", "close_ad", "launch_skip", "launch_close"
     };
     
-    // 跳过按钮的常见描述关键词
-    private static final String[] SKIP_DESC_KEYWORDS = {
-        "跳过", "关闭", "skip", "close", "jump",
-        "跳过广告", "关闭广告", "广告跳过"
-    };
-    
-    // 需要跳过广告的常见应用包名
-    private static final String[] TARGET_PACKAGES = {
-        "com.tencent.mm",           // 微信
-        "com.tencent.mobileqq",     // QQ
-        "com.taobao.taobao",        // 淘宝
-        "com.tmall.wireless",       // 天猫
-        "com.jingdong.app.mall",    // 京东
-        "com.sina.weibo",           // 微博
-        "com.ss.android.article.news", // 今日头条
-        "com.smile.gifmaker",       // 快手
-        "com.ss.android.ugc.aweme", // 抖音
-        "com.netease.cloudmusic",   // 网易云音乐
-        "com.tencent.qqlive",       // 腾讯视频
-        "com.youku.phone",          // 优酷
-        "com.douban.frodo",         // 豆瓣
-        "com.zhihu.android",        // 知乎
-        "com.xunmeng.pinduoduo",    // 拼多多
-        "com.eg.android.AlipayGphone", // 支付宝
-        "com.baidu.searchbox",      // 百度
-        "com.qiyi.video",           // 爱奇艺
-        "com.cmbchina.cmbproduction", // 招商银行
-        "com.ccb.smartpos"          // 建设银行
+    // 广告相关的类名关键词
+    private static final String[] AD_ACTIVITY_KEYWORDS = {
+        "splash", "launch", "ad", "welcome", "start"
     };
     
     private Handler handler;
     private SharedPreferences preferences;
     private int skipCount = 0;
+    
+    // 记录每个应用的启动时间
+    private Map<String, Long> appLaunchTimes = new HashMap<>();
+    // 记录每个应用本次启动是否已经处理过
+    private Set<String> processedApps = new HashSet<>();
+    
+    // 应用启动后检测广告的时间窗口（毫秒）
+    private static final long AD_DETECT_WINDOW = 8000; // 8秒内认为是开屏广告
+    
+    // 最小点击间隔
+    private static final long MIN_CLICK_INTERVAL = 2000; // 2秒
+    
     private long lastClickTime = 0;
-    private static final long CLICK_INTERVAL = 500; // 点击间隔，防止重复点击
+    private String lastPackageName = "";
     
     private static SkipAdAccessibilityService instance;
     
@@ -121,19 +110,90 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         
         int eventType = event.getEventType();
         
-        // 监听窗口状态变化和窗口内容变化
-        if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-            
+        // 只监听窗口状态变化（应用切换）
+        if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             String packageName = event.getPackageName() != null ? 
                 event.getPackageName().toString() : "";
+            String className = event.getClassName() != null ? 
+                event.getClassName().toString() : "";
             
-            // 检查是否是目标应用
-            if (isTargetPackage(packageName)) {
-                // 延迟一小段时间，等待广告加载完成
-                handler.postDelayed(() -> findAndClickSkipButton(), 300);
+            // 忽略系统界面和本应用
+            if (isSystemPackage(packageName) || packageName.equals(getPackageName())) {
+                return;
+            }
+            
+            // 检测到应用切换
+            if (!packageName.equals(lastPackageName)) {
+                Log.d(TAG, "应用切换: " + lastPackageName + " -> " + packageName);
+                
+                // 记录新应用的启动时间
+                appLaunchTimes.put(packageName, System.currentTimeMillis());
+                // 清除该应用的处理标记
+                processedApps.remove(packageName);
+                
+                lastPackageName = packageName;
+            }
+            
+            // 检查是否在广告检测时间窗口内
+            Long launchTime = appLaunchTimes.get(packageName);
+            if (launchTime == null) {
+                launchTime = System.currentTimeMillis();
+                appLaunchTimes.put(packageName, launchTime);
+            }
+            
+            long timeSinceLaunch = System.currentTimeMillis() - launchTime;
+            
+            // 只在应用启动后的时间窗口内检测，且未处理过
+            if (timeSinceLaunch < AD_DETECT_WINDOW && !processedApps.contains(packageName)) {
+                // 检查当前界面是否可能是广告界面
+                if (isPossibleAdScreen(packageName, className)) {
+                    Log.d(TAG, "检测到可能的广告界面: " + className);
+                    
+                    // 延迟检测，等待广告加载
+                    handler.postDelayed(() -> {
+                        if (!processedApps.contains(packageName)) {
+                            findAndClickSkipButton(packageName);
+                        }
+                    }, 500);
+                }
             }
         }
+    }
+    
+    /**
+     * 检查是否是系统包
+     */
+    private boolean isSystemPackage(String packageName) {
+        if (packageName == null) return true;
+        return packageName.startsWith("com.android.") ||
+               packageName.startsWith("android.") ||
+               packageName.equals("com.android.systemui") ||
+               packageName.equals("com.android.launcher") ||
+               packageName.equals("com.android.launcher3") ||
+               packageName.contains("launcher");
+    }
+    
+    /**
+     * 检查当前界面是否可能是广告界面
+     */
+    private boolean isPossibleAdScreen(String packageName, String className) {
+        if (className == null || className.isEmpty()) return false;
+        
+        String lowerClassName = className.toLowerCase();
+        
+        // 检查类名是否包含广告相关关键词
+        for (String keyword : AD_ACTIVITY_KEYWORDS) {
+            if (lowerClassName.contains(keyword)) {
+                return true;
+            }
+        }
+        
+        // 如果是主Activity，也可能是开屏广告
+        if (lowerClassName.contains("main") || lowerClassName.contains("home")) {
+            return true;
+        }
+        
+        return false;
     }
 
     @Override
@@ -145,32 +205,16 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         Log.d(TAG, "无障碍服务已连接");
-        
-        // 启动保活服务
         startKeepAliveService();
-    }
-
-    /**
-     * 检查是否是目标应用包名
-     */
-    private boolean isTargetPackage(String packageName) {
-        if (packageName == null || packageName.isEmpty()) return false;
-        
-        for (String target : TARGET_PACKAGES) {
-            if (packageName.equals(target)) {
-                return true;
-            }
-        }
-        return true; // 默认对所有应用生效
     }
 
     /**
      * 查找并点击跳过按钮
      */
-    private void findAndClickSkipButton() {
+    private void findAndClickSkipButton(String packageName) {
         // 防止频繁点击
         long currentTime = System.currentTimeMillis();
-        if (currentTime - lastClickTime < CLICK_INTERVAL) {
+        if (currentTime - lastClickTime < MIN_CLICK_INTERVAL) {
             return;
         }
         
@@ -180,165 +224,115 @@ public class SkipAdAccessibilityService extends AccessibilityService {
             return;
         }
         
+        // 标记该应用已处理
+        processedApps.add(packageName);
+        
         // 查找跳过按钮
-        List<AccessibilityNodeInfo> skipNodes = new ArrayList<>();
+        AccessibilityNodeInfo skipButton = findSkipButton(rootNode);
         
-        // 方法1：通过文本查找
-        for (String keyword : SKIP_KEYWORDS) {
-            List<AccessibilityNodeInfo> nodes = rootNode.findAccessibilityNodeInfosByText(keyword);
-            if (nodes != null && !nodes.isEmpty()) {
-                for (AccessibilityNodeInfo node : nodes) {
-                    if (isSkipButton(node)) {
-                        skipNodes.add(node);
-                    }
-                }
-            }
-        }
-        
-        // 方法2：通过ID查找
-        if (skipNodes.isEmpty()) {
-            for (String idKeyword : SKIP_ID_KEYWORDS) {
-                List<AccessibilityNodeInfo> nodes = findNodesByIdKeyword(rootNode, idKeyword);
-                if (nodes != null && !nodes.isEmpty()) {
-                    skipNodes.addAll(nodes);
-                }
-            }
-        }
-        
-        // 方法3：通过内容描述查找
-        if (skipNodes.isEmpty()) {
-            for (String desc : SKIP_DESC_KEYWORDS) {
-                List<AccessibilityNodeInfo> nodes = rootNode.findAccessibilityNodeInfosByText(desc);
-                if (nodes != null && !nodes.isEmpty()) {
-                    for (AccessibilityNodeInfo node : nodes) {
-                        if (node.getContentDescription() != null &&
-                            node.getContentDescription().toString().contains(desc)) {
-                            skipNodes.add(node);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // 方法4：查找特定位置的关闭按钮（右上角或右下角的小按钮）
-        if (skipNodes.isEmpty()) {
-            findCloseButtonByPosition(rootNode, skipNodes);
-        }
-        
-        // 尝试点击找到的跳过按钮
-        for (AccessibilityNodeInfo node : skipNodes) {
-            if (performClick(node)) {
+        if (skipButton != null) {
+            Log.d(TAG, "找到跳过按钮: " + getNodeDescription(skipButton));
+            
+            if (performClick(skipButton)) {
                 lastClickTime = currentTime;
                 skipCount++;
                 saveSkipCount();
                 Log.d(TAG, "成功点击跳过按钮，总次数: " + skipCount);
-                break;
             }
+        } else {
+            // 如果没找到，移除处理标记，允许再次检测
+            processedApps.remove(packageName);
         }
         
         rootNode.recycle();
     }
-
+    
     /**
-     * 判断节点是否是跳过按钮
+     * 查找跳过按钮（更严格的判断）
      */
-    private boolean isSkipButton(AccessibilityNodeInfo node) {
-        if (node == null) return false;
+    private AccessibilityNodeInfo findSkipButton(AccessibilityNodeInfo root) {
+        if (root == null) return null;
+        
+        List<AccessibilityNodeInfo> candidates = new ArrayList<>();
+        
+        // 遍历所有节点
+        findSkipButtonRecursive(root, candidates);
+        
+        // 返回最可能的跳过按钮
+        if (!candidates.isEmpty()) {
+            // 优先选择右上角的按钮
+            for (AccessibilityNodeInfo node : candidates) {
+                Rect bounds = new Rect();
+                node.getBoundsInScreen(bounds);
+                
+                // 检查是否在右上角区域
+                if (bounds.right > getScreenWidth(root) * 0.6f && 
+                    bounds.top < getScreenHeight(root) * 0.4f) {
+                    return node;
+                }
+            }
+            
+            // 否则返回第一个
+            return candidates.get(0);
+        }
+        
+        return null;
+    }
+    
+    private void findSkipButtonRecursive(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> candidates) {
+        if (node == null) return;
         
         // 检查文本
-        CharSequence text = node.getText();
-        if (text != null) {
-            String textStr = text.toString().toLowerCase().trim();
-            for (String keyword : SKIP_KEYWORDS) {
-                if (textStr.contains(keyword.toLowerCase())) {
-                    return true;
+        CharSequence textSeq = node.getText();
+        if (textSeq != null) {
+            String text = textSeq.toString().trim();
+            
+            // 精确匹配
+            for (String skipText : EXACT_SKIP_TEXTS) {
+                if (text.equalsIgnoreCase(skipText)) {
+                    Log.d(TAG, "精确匹配跳过按钮: " + text);
+                    candidates.add(node);
+                    return;
                 }
+            }
+            
+            // 倒计时模式匹配
+            if (COUNTDOWN_PATTERN.matcher(text).find()) {
+                Log.d(TAG, "倒计时跳过按钮: " + text);
+                candidates.add(node);
+                return;
+            }
+            
+            // 包含"跳过"且长度较短（排除正常内容）
+            if (text.length() <= 15 && text.contains("跳过")) {
+                Log.d(TAG, "短文本跳过按钮: " + text);
+                candidates.add(node);
+                return;
             }
         }
         
         // 检查内容描述
-        CharSequence contentDesc = node.getContentDescription();
-        if (contentDesc != null) {
-            String descStr = contentDesc.toString().toLowerCase().trim();
-            for (String keyword : SKIP_KEYWORDS) {
-                if (descStr.contains(keyword.toLowerCase())) {
-                    return true;
+        CharSequence descSeq = node.getContentDescription();
+        if (descSeq != null) {
+            String desc = descSeq.toString().trim();
+            for (String skipText : EXACT_SKIP_TEXTS) {
+                if (desc.equalsIgnoreCase(skipText)) {
+                    Log.d(TAG, "内容描述匹配跳过按钮: " + desc);
+                    candidates.add(node);
+                    return;
                 }
             }
         }
         
-        return false;
-    }
-
-    /**
-     * 通过ID关键词查找节点
-     */
-    private List<AccessibilityNodeInfo> findNodesByIdKeyword(AccessibilityNodeInfo root, String keyword) {
-        List<AccessibilityNodeInfo> result = new ArrayList<>();
-        if (root == null) return result;
-        
-        String id = root.getViewIdResourceName();
-        if (id != null && id.toLowerCase().contains(keyword.toLowerCase())) {
-            // 检查是否是可点击的按钮
-            if (root.isClickable() || root.getClassName().toString().contains("Button") ||
-                root.getClassName().toString().contains("ImageView") ||
-                root.getClassName().toString().contains("TextView")) {
-                result.add(root);
-            }
-        }
-        
-        // 递归查找子节点
-        int childCount = root.getChildCount();
-        for (int i = 0; i < childCount; i++) {
-            AccessibilityNodeInfo child = root.getChild(i);
-            if (child != null) {
-                result.addAll(findNodesByIdKeyword(child, keyword));
-            }
-        }
-        
-        return result;
-    }
-
-    /**
-     * 根据位置查找关闭按钮（通常在右上角或右下角）
-     */
-    private void findCloseButtonByPosition(AccessibilityNodeInfo root, List<AccessibilityNodeInfo> skipNodes) {
-        if (root == null) return;
-        
-        Rect bounds = new Rect();
-        root.getBoundsInScreen(bounds);
-        int screenWidth = bounds.width();
-        int screenHeight = bounds.height();
-        
-        findCloseButtonByPositionRecursive(root, skipNodes, screenWidth, screenHeight);
-    }
-    
-    private void findCloseButtonByPositionRecursive(AccessibilityNodeInfo node, 
-            List<AccessibilityNodeInfo> skipNodes, int screenWidth, int screenHeight) {
-        if (node == null) return;
-        
-        Rect bounds = new Rect();
-        node.getBoundsInScreen(bounds);
-        
-        // 检查是否是小尺寸的可点击元素（可能是关闭按钮）
-        int width = bounds.width();
-        int height = bounds.height();
-        
-        // 关闭按钮通常比较小（30-100dp）
-        if (width > 0 && width < 200 && height > 0 && height < 200) {
-            // 检查是否在右上角或右下角
-            boolean isTopRight = bounds.right > screenWidth * 0.7f && bounds.top < screenHeight * 0.3f;
-            boolean isBottomRight = bounds.right > screenWidth * 0.7f && bounds.bottom > screenHeight * 0.7f;
-            
-            if ((isTopRight || isBottomRight) && (node.isClickable() || node.isClickable())) {
-                // 检查是否包含关闭相关的文本或描述
-                CharSequence text = node.getText();
-                CharSequence desc = node.getContentDescription();
-                
-                if ((text != null && isCloseText(text.toString())) ||
-                    (desc != null && isCloseText(desc.toString())) ||
-                    (text == null && desc == null && width < 80 && height < 80)) {
-                    skipNodes.add(node);
+        // 检查ID
+        String id = node.getViewIdResourceName();
+        if (id != null) {
+            String lowerId = id.toLowerCase();
+            for (String idKeyword : SKIP_ID_KEYWORDS) {
+                if (lowerId.contains(idKeyword)) {
+                    Log.d(TAG, "ID匹配跳过按钮: " + id);
+                    candidates.add(node);
+                    return;
                 }
             }
         }
@@ -348,16 +342,35 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         for (int i = 0; i < childCount; i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) {
-                findCloseButtonByPositionRecursive(child, skipNodes, screenWidth, screenHeight);
+                findSkipButtonRecursive(child, candidates);
             }
         }
     }
     
-    private boolean isCloseText(String text) {
-        if (text == null) return false;
-        String lower = text.toLowerCase().trim();
-        return lower.equals("×") || lower.equals("x") || lower.equals("跳过") ||
-               lower.equals("关闭") || lower.equals("skip") || lower.equals("close");
+    private int getScreenWidth(AccessibilityNodeInfo node) {
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        return bounds.width() > 0 ? bounds.width() : 1080;
+    }
+    
+    private int getScreenHeight(AccessibilityNodeInfo node) {
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        return bounds.height() > 0 ? bounds.height() : 1920;
+    }
+    
+    private String getNodeDescription(AccessibilityNodeInfo node) {
+        StringBuilder sb = new StringBuilder();
+        if (node.getText() != null) {
+            sb.append("text=").append(node.getText());
+        }
+        if (node.getContentDescription() != null) {
+            sb.append(" desc=").append(node.getContentDescription());
+        }
+        if (node.getViewIdResourceName() != null) {
+            sb.append(" id=").append(node.getViewIdResourceName());
+        }
+        return sb.toString();
     }
 
     /**
@@ -369,6 +382,19 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         // 尝试直接点击
         if (node.isClickable()) {
             return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        }
+        
+        // 尝试点击父节点
+        AccessibilityNodeInfo parent = node.getParent();
+        while (parent != null) {
+            if (parent.isClickable()) {
+                boolean clicked = parent.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                parent.recycle();
+                return clicked;
+            }
+            AccessibilityNodeInfo grandParent = parent.getParent();
+            parent.recycle();
+            parent = grandParent;
         }
         
         // 尝试通过手势点击
