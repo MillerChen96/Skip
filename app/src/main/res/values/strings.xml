@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">跳广告助手</string>
+    <string name="accessibility_service_description">自动检测并点击应用开屏广告的跳过按钮，帮助您快速跳过广告。本应用不联网，保护您的隐私。</string>
+    <string name="service_status">服务状态</string>
+    <string name="service_running">服务运行中</string>
+    <string name="service_stopped">服务未运行</string>
+    <string name="open_accessibility">打开无障碍服务</string>
+    <string name="start_service">启动服务</string>
+    <string name="stop_service">停止服务</string>
+    <string name="auto_start">开机自启动</string>
+    <string name="skip_count">已跳过广告次数</string>
+    <string name="permission_required">需要权限</string>
+    <string name="overlay_permission_desc">需要悬浮窗权限以保持后台运行</string>
+    <string name="battery_optimization">电池优化</string>
+    <string name="battery_optimization_desc">请将本应用加入电池优化白名单，防止被系统杀死</string>
+    <string name="accessibility_permission">无障碍服务权限</string>
+    <string name="accessibility_permission_desc">请开启无障碍服务以自动跳过广告</string>
+</resources>
