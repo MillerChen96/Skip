@@ -20,15 +20,14 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
  * 跳过广告的无障碍服务
  * 
- * 完全参考 zfdang/Android-Touch-Helper (5.3k stars) 的实现
+ * 参考 zfdang/Android-Touch-Helper (5.3k stars) 的实现
  * 
  * 核心策略：
- * 1. 只对已安装的第三方应用启动检测
+ * 1. 对所有第三方应用启动检测（不限制包名列表）
  * 2. 使用线程池异步执行检测
  * 3. 广度优先遍历节点
  * 4. 关键词匹配：文本长度 <= 关键词长度 + 6
@@ -38,9 +37,9 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     private static final String TAG = "SkipAdService";
     private static final String SELF_PACKAGE_NAME = "跳广告助手";
     
-    // 跳过按钮关键词（参考 Android-Touch-Helper，默认只有"跳过"）
+    // 跳过按钮关键词
     private static final String[] KEYWORDS = {
-        "跳过", "关闭", "跳过广告", "关闭广告",
+        "跳过", "关闭", "跳过广告", "关闭广告", "立即跳过",
         "skip", "close", "dismiss", "×", "X"
     };
     
@@ -50,11 +49,8 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         "splash", "ad_skip", "ad_close"
     };
     
-    // 检测配置（参考 Android-Touch-Helper）
-    private static final int SKIP_AD_DURATION = 6;  // 跳过广告检测持续时间（秒）
-    private static final int PACKAGE_POSITION_CLICK_FIRST_DELAY = 300;  // 首次点击延迟
-    private static final int PACKAGE_POSITION_CLICK_RETRY_INTERVAL = 500; // 点击重试间隔
-    private static final int PACKAGE_POSITION_CLICK_RETRY = 6;  // 最大重试次数
+    // 检测配置
+    private static final long SKIP_AD_DURATION = 8000;  // 跳过广告检测持续时间（毫秒）
     
     private Handler handler;
     private SharedPreferences preferences;
@@ -73,9 +69,6 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     
     // 已点击的控件
     private Set<String> clickedWidgets;
-    
-    // 需要检测的应用包名集合
-    private Set<String> setPackages;
     
     // 输入法应用包名（需要排除）
     private Set<String> setIMEApps;
@@ -100,8 +93,8 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         clickedWidgets = new HashSet<>();
         taskExecutorService = Executors.newSingleThreadScheduledExecutor();
         
-        // 初始化应用包名集合
-        updatePackages();
+        // 初始化输入法应用包名
+        updateIMEApps();
         
         Log.d(TAG, "服务创建");
     }
@@ -124,14 +117,23 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         CharSequence tempClassName = event.getClassName();
         if (tempPkgName == null || tempClassName == null) return;
         
+        String pkgName = tempPkgName.toString();
+        String className = tempClassName.toString();
+        
+        // 排除系统应用和自身
+        if (isSystemPackage(pkgName)) return;
+        
+        // 排除输入法应用
+        if (setIMEApps != null && setIMEApps.contains(pkgName)) return;
+        
         try {
             switch (event.getEventType()) {
                 case AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED:
-                    handleWindowStateChanged(tempPkgName.toString(), tempClassName.toString());
+                    handleWindowStateChanged(pkgName, className);
                     break;
                     
                 case AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED:
-                    handleWindowContentChanged(tempPkgName.toString(), event.getSource());
+                    handleWindowContentChanged(pkgName, event.getSource());
                     break;
             }
         } catch (Exception e) {
@@ -141,14 +143,8 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     
     /**
      * 处理窗口状态变化事件
-     * 参考 Android-Touch-Helper 的实现
      */
     private void handleWindowStateChanged(String pkgName, String className) {
-        // 排除输入法应用
-        if (setIMEApps.contains(pkgName)) {
-            return;
-        }
-        
         // 判断是否是Activity
         boolean isActivity = !className.startsWith("android.") && !className.startsWith("androidx.");
         
@@ -163,40 +159,41 @@ public class SkipAdAccessibilityService extends AccessibilityService {
                 currentPackageName = pkgName;
                 currentActivityName = className;
                 
-                // 只有在需要检测的应用列表中才启动跳过广告流程
-                if (setPackages.contains(pkgName)) {
-                    startSkipAdProcess();
-                }
+                // 对所有第三方应用启动跳过广告流程
+                startSkipAdProcess();
             }
         } else {
             // 同一应用内Activity切换
             if (isActivity && !className.equals(currentActivityName)) {
                 Log.d(TAG, "Activity切换: " + currentActivityName + " -> " + className);
                 currentActivityName = className;
-                // 注意：Android-Touch-Helper 注释掉了这里停止检测的逻辑
-                // 因为有些广告Activity不是第一个Activity
             }
         }
         
         // 执行跳过广告检测
-        if (skipAdByKeyword) {
-            final AccessibilityNodeInfo root = getRootInActiveWindow();
-            if (root != null) {
-                taskExecutorService.execute(() -> iterateNodesToSkipAd(root, null));
-            }
-        }
+        performSkipAdDetection();
     }
     
     /**
      * 处理窗口内容变化事件
      */
     private void handleWindowContentChanged(String pkgName, AccessibilityNodeInfo source) {
-        if (!setPackages.contains(pkgName)) {
-            return;
-        }
+        if (!pkgName.equals(currentPackageName)) return;
         
         if (skipAdByKeyword && source != null) {
-            taskExecutorService.execute(() -> iterateNodesToSkipAd(source, null));
+            taskExecutorService.execute(() -> iterateNodesToSkipAd(source));
+        }
+    }
+    
+    /**
+     * 执行跳过广告检测
+     */
+    private void performSkipAdDetection() {
+        if (!skipAdByKeyword) return;
+        
+        final AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root != null) {
+            taskExecutorService.execute(() -> iterateNodesToSkipAd(root));
         }
     }
     
@@ -204,14 +201,17 @@ public class SkipAdAccessibilityService extends AccessibilityService {
      * 开始跳过广告流程
      */
     private void startSkipAdProcess() {
-        Log.d(TAG, "开始跳过广告流程");
+        Log.d(TAG, "开始跳过广告流程: " + currentPackageName);
         skipAdRunning = true;
         skipAdByKeyword = true;
         clickedWidgets.clear();
         
         // 设置超时停止
         handler.removeCallbacksAndMessages(null);
-        handler.postDelayed(this::stopSkipAdProcess, SKIP_AD_DURATION * 1000L);
+        handler.postDelayed(this::stopSkipAdProcess, SKIP_AD_DURATION);
+        
+        // 立即执行一次检测
+        handler.postDelayed(this::performSkipAdDetection, 300);
     }
     
     /**
@@ -227,12 +227,10 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     
     /**
      * 遍历节点跳过广告
-     * 完全参考 Android-Touch-Helper 的 iterateNodesToSkipAd 方法
-     * 
-     * @param root 根节点
-     * @param set 传入set时按控件判断，否则按关键词判断
      */
-    private void iterateNodesToSkipAd(AccessibilityNodeInfo root, Set<String> set) {
+    private void iterateNodesToSkipAd(AccessibilityNodeInfo root) {
+        if (root == null || !skipAdRunning) return;
+        
         ArrayList<AccessibilityNodeInfo> topNodes = new ArrayList<>();
         topNodes.add(root);
         ArrayList<AccessibilityNodeInfo> childNodes = new ArrayList<>();
@@ -255,7 +253,10 @@ public class SkipAdAccessibilityService extends AccessibilityService {
                 
                 // 添加子节点
                 for (int n = 0; n < node.getChildCount(); n++) {
-                    childNodes.add(node.getChild(n));
+                    AccessibilityNodeInfo child = node.getChild(n);
+                    if (child != null) {
+                        childNodes.add(child);
+                    }
                 }
                 node.recycle();
             }
@@ -285,7 +286,6 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     
     /**
      * 查找并点击包含keyword控件
-     * 完全参考 Android-Touch-Helper 的 skipAdByKeywords 方法
      */
     private boolean skipAdByKeywords(AccessibilityNodeInfo node) {
         if (node == null) return false;
@@ -293,29 +293,34 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         CharSequence description = node.getContentDescription();
         CharSequence text = node.getText();
         
-        if (TextUtils.isEmpty(description) && TextUtils.isEmpty(text)) {
-            return false;
-        }
-        
         // 尝试匹配关键词
         boolean isFound = false;
-        for (String keyword : KEYWORDS) {
-            // 文本或描述包含关键词，但长度不能太长（<= 关键词长度 + 6）
-            if (text != null && 
-                (text.toString().length() <= keyword.length() + 6) && 
-                text.toString().contains(keyword) && 
-                !text.toString().equals(SELF_PACKAGE_NAME)) {
-                isFound = true;
-            } else if (description != null && 
-                       (description.toString().length() <= keyword.length() + 6) && 
-                       description.toString().contains(keyword) && 
-                       !description.toString().equals(SELF_PACKAGE_NAME)) {
-                isFound = true;
+        String matchedKeyword = "";
+        
+        // 文本匹配
+        if (!TextUtils.isEmpty(text)) {
+            String textStr = text.toString();
+            for (String keyword : KEYWORDS) {
+                // 文本包含关键词，且长度不能太长
+                int maxLen = Math.max(keyword.length() + 6, 10); // 至少允许10个字符
+                if (textStr.length() <= maxLen && textStr.contains(keyword)) {
+                    isFound = true;
+                    matchedKeyword = keyword;
+                    break;
+                }
             }
-            
-            if (isFound) {
-                Log.d(TAG, "匹配关键词: " + keyword);
-                break;
+        }
+        
+        // 描述匹配
+        if (!isFound && !TextUtils.isEmpty(description)) {
+            String descStr = description.toString();
+            for (String keyword : KEYWORDS) {
+                int maxLen = Math.max(keyword.length() + 6, 10);
+                if (descStr.length() <= maxLen && descStr.contains(keyword)) {
+                    isFound = true;
+                    matchedKeyword = keyword;
+                    break;
+                }
             }
         }
         
@@ -327,7 +332,7 @@ public class SkipAdAccessibilityService extends AccessibilityService {
                 for (String skipId : SKIP_IDS) {
                     if (lowerId.contains(skipId)) {
                         isFound = true;
-                        Log.d(TAG, "匹配ID: " + skipId);
+                        matchedKeyword = "id:" + skipId;
                         break;
                     }
                 }
@@ -338,25 +343,19 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         
         // 生成节点描述
         String nodeDesc = describeNode(node);
-        Log.d(TAG, "找到跳过按钮: " + nodeDesc);
+        Log.d(TAG, "找到跳过按钮: keyword=" + matchedKeyword + ", " + nodeDesc);
         
         // 检查是否已点击过
         if (clickedWidgets.contains(nodeDesc)) {
+            Log.d(TAG, "已点击过，跳过");
             return false;
         }
         
         clickedWidgets.add(nodeDesc);
         
         // 执行点击
-        boolean clicked = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-        Log.d(TAG, "直接点击结果: " + clicked);
-        
-        if (!clicked) {
-            Rect rect = new Rect();
-            node.getBoundsInScreen(rect);
-            clicked = click(rect.centerX(), rect.centerY(), 0, 20);
-            Log.d(TAG, "手势点击结果: " + clicked);
-        }
+        boolean clicked = performClick(node);
+        Log.d(TAG, "点击结果: " + clicked);
         
         if (clicked) {
             skipCount++;
@@ -364,20 +363,52 @@ public class SkipAdAccessibilityService extends AccessibilityService {
             Log.d(TAG, "点击成功，总次数: " + skipCount);
         }
         
-        return true;
+        return clicked;
     }
     
     /**
-     * 模拟点击
+     * 执行点击
      */
-    private boolean click(int X, int Y, long start_time, long duration) {
+    private boolean performClick(AccessibilityNodeInfo node) {
+        if (node == null) return false;
+        
+        // 尝试直接点击
+        if (node.isClickable()) {
+            boolean success = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+            if (success) return true;
+        }
+        
+        // 尝试点击父节点
+        AccessibilityNodeInfo parent = node.getParent();
+        while (parent != null) {
+            if (parent.isClickable()) {
+                boolean success = parent.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                parent.recycle();
+                if (success) return true;
+                break;
+            }
+            AccessibilityNodeInfo grandParent = parent.getParent();
+            parent.recycle();
+            parent = grandParent;
+        }
+        
+        // 使用手势点击
+        Rect rect = new Rect();
+        node.getBoundsInScreen(rect);
+        return click(rect.centerX(), rect.centerY());
+    }
+    
+    /**
+     * 手势点击
+     */
+    private boolean click(int x, int y) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false;
         
         Path path = new Path();
-        path.moveTo(X, Y);
+        path.moveTo(x, y);
         
         GestureDescription.Builder builder = new GestureDescription.Builder()
-                .addStroke(new GestureDescription.StrokeDescription(path, start_time, duration));
+                .addStroke(new GestureDescription.StrokeDescription(path, 0, 40));
         
         return dispatchGesture(builder.build(), null, null);
     }
@@ -387,69 +418,41 @@ public class SkipAdAccessibilityService extends AccessibilityService {
      */
     private String describeNode(AccessibilityNodeInfo node) {
         StringBuilder sb = new StringBuilder();
-        sb.append("Node");
+        sb.append("[");
         
-        if (node.getClassName() != null) {
-            sb.append(" class=").append(node.getClassName());
+        if (node.getText() != null) {
+            sb.append("text='").append(node.getText()).append("'");
+        }
+        if (node.getContentDescription() != null) {
+            sb.append(" desc='").append(node.getContentDescription()).append("'");
+        }
+        if (node.getViewIdResourceName() != null) {
+            sb.append(" id='").append(node.getViewIdResourceName()).append("'");
         }
         
         Rect rect = new Rect();
         node.getBoundsInScreen(rect);
-        sb.append(" Position=[").append(rect.left).append(",").append(rect.right)
-          .append(",").append(rect.top).append(",").append(rect.bottom).append("]");
+        sb.append(" bounds=").append(rect.toShortString());
         
-        if (node.getViewIdResourceName() != null) {
-            sb.append(" ResourceId=").append(node.getViewIdResourceName());
-        }
-        if (node.getContentDescription() != null) {
-            sb.append(" Description=").append(node.getContentDescription());
-        }
-        if (node.getText() != null) {
-            sb.append(" Text=").append(node.getText());
-        }
-        
+        sb.append("]");
         return sb.toString();
     }
     
     /**
-     * 更新应用包名集合
-     * 参考 Android-Touch-Helper 的 updatePackage 方法
+     * 更新输入法应用包名
      */
-    private void updatePackages() {
-        setPackages = new HashSet<>();
+    private void updateIMEApps() {
         setIMEApps = new HashSet<>();
-        Set<String> setTemps = new HashSet<>();
-        
-        // 获取所有启动器应用
-        Intent intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-        List<android.content.pm.ResolveInfo> resolveInfoList = getPackageManager().queryIntentActivities(intent, android.content.pm.PackageManager.MATCH_ALL);
-        for (android.content.pm.ResolveInfo e : resolveInfoList) {
-            setPackages.add(e.activityInfo.packageName);
+        try {
+            android.view.inputmethod.InputMethodManager imm = 
+                (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+            List<android.view.inputmethod.InputMethodInfo> inputMethodInfoList = imm.getInputMethodList();
+            for (android.view.inputmethod.InputMethodInfo e : inputMethodInfoList) {
+                setIMEApps.add(e.getPackageName());
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "获取输入法列表失败: " + e.getMessage());
         }
-        
-        // 获取所有桌面应用
-        intent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
-        resolveInfoList = getPackageManager().queryIntentActivities(intent, android.content.pm.PackageManager.MATCH_ALL);
-        for (android.content.pm.ResolveInfo e : resolveInfoList) {
-            setTemps.add(e.activityInfo.packageName);
-        }
-        
-        // 获取所有输入法应用
-        android.view.inputmethod.InputMethodManager imm = (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
-        List<android.view.inputmethod.InputMethodInfo> inputMethodInfoList = imm.getInputMethodList();
-        for (android.view.inputmethod.InputMethodInfo e : inputMethodInfoList) {
-            setIMEApps.add(e.getPackageName());
-        }
-        
-        // 排除自身和系统应用
-        setTemps.add(getPackageName());
-        setTemps.add("com.android.settings");
-        
-        // 从检测列表中移除桌面、输入法和系统应用
-        setPackages.removeAll(setTemps);
-        setPackages.removeAll(setIMEApps);
-        
-        Log.d(TAG, "检测应用数量: " + setPackages.size());
     }
     
     private boolean isSystemPackage(String packageName) {
