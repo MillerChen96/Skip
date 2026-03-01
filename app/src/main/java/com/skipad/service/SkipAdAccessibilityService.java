@@ -15,6 +15,8 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -27,31 +29,28 @@ import java.util.Set;
  * 核心策略：
  * 1. 同时监听 WINDOW_STATE_CHANGED 和 WINDOW_CONTENT_CHANGED
  * 2. 关键词匹配：文本长度 <= 关键词长度 + 6
- * 3. 使用 clickedWidgets 防止重复点击
- * 4. 支持多种跳过方式：关键词、ID、位置
+ * 3. 多按钮时优先点击右上角的小按钮
+ * 4. 使用 clickedWidgets 防止重复点击
  */
 public class SkipAdAccessibilityService extends AccessibilityService {
 
     private static final String TAG = "SkipAdService";
     
-    // 跳过按钮关键词（参考 Android-Touch-Helper）
+    // 跳过按钮关键词（扩展列表）
+    // 参考 Android-Touch-Helper，默认只有"跳过"，用户可自定义
     private static final String[] KEYWORDS = {
         "跳过", "关闭", "跳过广告", "关闭广告", "立即跳过",
-        "skip", "close", "skip ad", "close ad", "dismiss",
-        "跳过 >", "跳过>", ">跳过", "×", "X"
+        "skip", "close", "dismiss", "跳过 >", "×", "X"
     };
     
     // 跳过按钮ID关键词
     private static final String[] SKIP_IDS = {
         "skip", "close", "jump", "dismiss", "cancel",
-        "splash", "ad_skip", "ad_close"
+        "splash", "ad_skip", "ad_close", "btn_skip", "btn_close"
     };
     
     // 检测配置
     private static final long SKIP_AD_DURATION = 8000;  // 跳过广告检测持续时间
-    private static final int MAX_CLICK_RETRY = 6;       // 最大点击重试次数
-    private static final long CLICK_FIRST_DELAY = 300;  // 首次点击延迟
-    private static final long CLICK_RETRY_INTERVAL = 500; // 点击重试间隔
     
     private Handler handler;
     private SharedPreferences preferences;
@@ -133,13 +132,14 @@ public class SkipAdAccessibilityService extends AccessibilityService {
                         currentActivityName = className;
                     }
                 }
-                
                 // 执行跳过广告检测
                 if (skipAdByKeyword) {
-                    AccessibilityNodeInfo root = getRootInActiveWindow();
+                    final AccessibilityNodeInfo root = getRootInActiveWindow();
                     if (root != null) {
-                        iterateNodesToSkipAd(root);
-                        root.recycle();
+                        new Thread(() -> {
+                            findAndClickAllSkipButtons(root);
+                            root.recycle();
+                        }).start();
                     }
                 }
                 break;
@@ -147,10 +147,12 @@ public class SkipAdAccessibilityService extends AccessibilityService {
             case AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED:
                 // 窗口内容变化时也检测
                 if (skipAdByKeyword && pkgName.equals(currentPackageName)) {
-                    AccessibilityNodeInfo source = event.getSource();
+                    final AccessibilityNodeInfo source = event.getSource();
                     if (source != null) {
-                        iterateNodesToSkipAd(source);
-                        source.recycle();
+                        new Thread(() -> {
+                            findAndClickAllSkipButtons(source);
+                            source.recycle();
+                        }).start();
                     }
                 }
                 break;
@@ -183,10 +185,10 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     }
     
     /**
-     * 遍历节点查找并点击跳过按钮
-     * 参考 Android-Touch-Helper 的实现
+     * 查找并点击所有跳过按钮
+     * 当有多个跳过按钮时，按优先级排序后依次点击
      */
-    private void iterateNodesToSkipAd(AccessibilityNodeInfo root) {
+    private void findAndClickAllSkipButtons(AccessibilityNodeInfo root) {
         if (root == null || !skipAdRunning) return;
         
         // 更新屏幕尺寸
@@ -195,120 +197,147 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         screenWidth = screenBounds.width();
         screenHeight = screenBounds.height();
         
-        // 广度优先遍历
-        List<AccessibilityNodeInfo> currentLevel = new ArrayList<>();
-        currentLevel.add(root);
+        // 收集所有匹配的节点
+        List<AccessibilityNodeInfo> matchedNodes = new ArrayList<>();
+        collectMatchedNodes(root, matchedNodes);
         
-        while (!currentLevel.isEmpty() && skipAdRunning) {
-            List<AccessibilityNodeInfo> nextLevel = new ArrayList<>();
-            
-            for (AccessibilityNodeInfo node : currentLevel) {
-                if (node == null) continue;
+        if (matchedNodes.isEmpty()) return;
+        
+        // 按优先级排序：右上角小按钮优先
+        Collections.sort(matchedNodes, new Comparator<AccessibilityNodeInfo>() {
+            @Override
+            public int compare(AccessibilityNodeInfo a, AccessibilityNodeInfo b) {
+                Rect rectA = new Rect();
+                Rect rectB = new Rect();
+                a.getBoundsInScreen(rectA);
+                b.getBoundsInScreen(rectB);
                 
-                // 尝试跳过广告
-                if (trySkipAd(node)) {
-                    // 成功点击，回收所有节点
-                    for (AccessibilityNodeInfo n : currentLevel) {
-                        if (n != null && n != node) n.recycle();
-                    }
-                    for (AccessibilityNodeInfo n : nextLevel) {
-                        if (n != null) n.recycle();
-                    }
-                    return;
-                }
+                // 计算优先级分数
+                int scoreA = calculatePriorityScore(rectA);
+                int scoreB = calculatePriorityScore(rectB);
                 
-                // 添加子节点到下一层
-                for (int i = 0; i < node.getChildCount(); i++) {
-                    AccessibilityNodeInfo child = node.getChild(i);
-                    if (child != null) {
-                        nextLevel.add(child);
-                    }
-                }
+                return scoreB - scoreA; // 降序
             }
             
-            // 回收当前层节点（除了根节点）
-            for (AccessibilityNodeInfo n : currentLevel) {
-                if (n != null && n != root) n.recycle();
+            private int calculatePriorityScore(Rect rect) {
+                int score = 0;
+                
+                // 右上角优先
+                if (rect.right > screenWidth * 0.6f && rect.top < screenHeight * 0.3f) {
+                    score += 100;
+                }
+                // 右下角次之
+                else if (rect.right > screenWidth * 0.6f && rect.bottom > screenHeight * 0.7f) {
+                    score += 80;
+                }
+                // 右侧其他位置
+                else if (rect.right > screenWidth * 0.5f) {
+                    score += 50;
+                }
+                
+                // 小按钮优先（更可能是跳过按钮）
+                int size = rect.width() * rect.height();
+                if (size < 10000) {
+                    score += 50;
+                } else if (size < 20000) {
+                    score += 30;
+                }
+                
+                return score;
+            }
+        });
+        
+        // 尝试点击每个匹配的节点
+        for (AccessibilityNodeInfo node : matchedNodes) {
+            if (!skipAdRunning) break;
+            
+            String nodeDesc = describeNode(node);
+            
+            // 检查是否已点击过
+            if (clickedWidgets.contains(nodeDesc)) {
+                continue;
             }
             
-            currentLevel = nextLevel;
+            Log.d(TAG, "尝试点击跳过按钮: " + nodeDesc);
+            clickedWidgets.add(nodeDesc);
+            
+            // 执行点击
+            if (performClick(node)) {
+                skipCount++;
+                saveSkipCount();
+                Log.d(TAG, "点击成功，总次数: " + skipCount);
+                
+                // 点击成功后稍等，避免连续点击
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
         }
     }
     
     /**
-     * 尝试跳过广告
+     * 收集所有匹配关键词的节点
+     */
+    private void collectMatchedNodes(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> matchedNodes) {
+        if (node == null) return;
+        
+        // 检查是否匹配
+        if (isMatchKeyword(node)) {
+            matchedNodes.add(node);
+        }
+        
+        // 递归检查子节点
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                collectMatchedNodes(child, matchedNodes);
+            }
+        }
+    }
+    
+    /**
+     * 检查节点是否匹配关键词
      * 参考 Android-Touch-Helper 的 skipAdByKeywords 方法
      */
-    private boolean trySkipAd(AccessibilityNodeInfo node) {
-        if (node == null) return false;
-        
+    private boolean isMatchKeyword(AccessibilityNodeInfo node) {
         CharSequence text = node.getText();
         CharSequence description = node.getContentDescription();
         
-        // 检查是否有文本或描述
-        if (TextUtils.isEmpty(text) && TextUtils.isEmpty(description)) {
-            return false;
-        }
-        
-        // 关键词匹配
-        boolean isFound = false;
-        String matchedKeyword = "";
-        
-        for (String keyword : KEYWORDS) {
-            // 文本匹配：文本长度 <= 关键词长度 + 6
-            if (text != null && text.length() <= keyword.length() + 6 && text.toString().contains(keyword)) {
-                isFound = true;
-                matchedKeyword = keyword;
-                break;
-            }
-            // 描述匹配
-            if (description != null && description.length() <= keyword.length() + 6 && description.toString().contains(keyword)) {
-                isFound = true;
-                matchedKeyword = keyword;
-                break;
-            }
-        }
-        
-        // ID匹配
-        if (!isFound) {
-            String id = node.getViewIdResourceName();
-            if (id != null) {
-                String lowerId = id.toLowerCase();
-                for (String skipId : SKIP_IDS) {
-                    if (lowerId.contains(skipId)) {
-                        isFound = true;
-                        matchedKeyword = "id:" + skipId;
-                        break;
-                    }
+        // 检查文本
+        if (!TextUtils.isEmpty(text)) {
+            String textStr = text.toString();
+            for (String keyword : KEYWORDS) {
+                // 文本长度 <= 关键词长度 + 6
+                if (textStr.length() <= keyword.length() + 6 && textStr.contains(keyword)) {
+                    return true;
                 }
             }
         }
         
-        if (!isFound) return false;
-        
-        // 生成节点描述用于去重
-        String nodeDesc = describeNode(node);
-        
-        // 检查是否已点击过
-        if (clickedWidgets.contains(nodeDesc)) {
-            return false;
+        // 检查描述
+        if (!TextUtils.isEmpty(description)) {
+            String descStr = description.toString();
+            for (String keyword : KEYWORDS) {
+                if (descStr.length() <= keyword.length() + 6 && descStr.contains(keyword)) {
+                    return true;
+                }
+            }
         }
         
-        Log.d(TAG, "找到跳过按钮: keyword=" + matchedKeyword + ", " + nodeDesc);
-        
-        // 添加到已点击集合
-        clickedWidgets.add(nodeDesc);
-        
-        // 执行点击
-        boolean clicked = performClick(node);
-        
-        if (clicked) {
-            skipCount++;
-            saveSkipCount();
-            Log.d(TAG, "点击成功，总次数: " + skipCount);
+        // 检查ID
+        String id = node.getViewIdResourceName();
+        if (id != null) {
+            String lowerId = id.toLowerCase();
+            for (String skipId : SKIP_IDS) {
+                if (lowerId.contains(skipId)) {
+                    return true;
+                }
+            }
         }
         
-        return clicked;
+        return false;
     }
     
     /**
