@@ -20,10 +20,10 @@ import java.util.List;
 /**
  * 跳过广告的无障碍服务
  * 
- * 核心策略：
- * 1. 只在应用启动后短暂的广告检测窗口内工作
- * 2. 应用切换到其他Activity后立即停止检测
- * 3. 使用严格的特征评分，避免误点击
+ * 策略：
+ * 1. 只在应用启动后的广告检测窗口内工作
+ * 2. 使用特征评分识别跳过按钮
+ * 3. 平衡准确性和召回率
  */
 public class SkipAdAccessibilityService extends AccessibilityService {
 
@@ -32,35 +32,38 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     // 跳过按钮文本特征
     private static final String[] SKIP_TEXTS = {
         "跳过", "关闭", "skip", "close", "dismiss", "jump",
-        "×", "X", "x", "跳过广告", "关闭广告"
+        "跳过广告", "关闭广告", "×", "X"
     };
     
     // 跳过按钮ID特征
     private static final String[] SKIP_IDS = {
-        "skip", "close", "jump", "dismiss", "cancel"
+        "skip", "close", "jump", "dismiss", "cancel",
+        "splash", "ad_", "launch"
     };
     
     // 检测配置
-    private static final long AD_DETECT_WINDOW = 6000;   // 广告检测窗口：6秒
-    private static final long DETECT_INTERVAL = 200;     // 检测间隔：200ms
-    private static final int MAX_DETECT_COUNT = 10;      // 最大检测次数
-    private static final long MIN_CLICK_INTERVAL = 1500; // 最小点击间隔
+    private static final long AD_DETECT_WINDOW = 8000;   // 广告检测窗口：8秒
+    private static final long DETECT_INTERVAL = 300;     // 检测间隔：300ms
+    private static final int MAX_DETECT_COUNT = 15;      // 最大检测次数
+    private static final long MIN_CLICK_INTERVAL = 1000; // 最小点击间隔
     
-    // 按钮尺寸限制（像素）
-    private static final int MIN_BUTTON_SIZE = 25;       // 最小25dp
-    private static final int MAX_BUTTON_SIZE = 120;      // 最大120dp（更严格）
+    // 按钮尺寸限制（像素，假设屏幕密度3，实际会根据屏幕调整）
+    private static final int MIN_BUTTON_SIZE_DP = 20;    // 最小20dp
+    private static final int MAX_BUTTON_SIZE_DP = 180;   // 最大180dp
     
-    // 位置阈值
-    private static final float RIGHT_THRESHOLD = 0.6f;   // 右60%区域
-    private static final float TOP_THRESHOLD = 0.3f;     // 顶部30%
-    private static final float BOTTOM_THRESHOLD = 0.7f;  // 底部30%
+    // 位置阈值（更宽松）
+    private static final float RIGHT_THRESHOLD = 0.4f;   // 右侧60%区域
+    private static final float TOP_THRESHOLD = 0.35f;    // 顶部35%
+    private static final float BOTTOM_THRESHOLD = 0.65f; // 底部35%
+    
+    // 评分阈值
+    private static final int MIN_SCORE_THRESHOLD = 45;   // 最低评分阈值
     
     private Handler handler;
     private SharedPreferences preferences;
     private int skipCount = 0;
     
     private String currentPackage = "";
-    private String currentActivity = "";
     private long appLaunchTime = 0;
     private int detectCount = 0;
     private boolean hasClicked = false;
@@ -69,6 +72,7 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     
     private int screenWidth = 1080;
     private int screenHeight = 1920;
+    private float density = 3.0f; // 屏幕密度
     
     private static SkipAdAccessibilityService instance;
     
@@ -87,7 +91,11 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         handler = new Handler(Looper.getMainLooper());
         preferences = getSharedPreferences("skip_ad_prefs", MODE_PRIVATE);
         skipCount = preferences.getInt("skip_count", 0);
-        Log.d(TAG, "服务创建");
+        
+        // 获取屏幕密度
+        density = getResources().getDisplayMetrics().density;
+        
+        Log.d(TAG, "服务创建, 屏幕密度: " + density);
     }
 
     @Override
@@ -102,52 +110,29 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         
         int eventType = event.getEventType();
         
-        // 监听窗口状态变化
+        // 只监听窗口状态变化
         if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             String packageName = event.getPackageName() != null ? 
                 event.getPackageName().toString() : "";
-            String className = event.getClassName() != null ? 
-                event.getClassName().toString() : "";
             
             // 忽略系统和自身
             if (isSystemPackage(packageName)) return;
             
-            // 检测Activity切换
+            // 应用切换
             if (!packageName.equals(currentPackage)) {
-                // 应用切换
                 Log.d(TAG, "应用切换: " + currentPackage + " -> " + packageName);
-                resetDetection();
+                
+                // 重置状态
+                stopDetection();
                 currentPackage = packageName;
                 appLaunchTime = System.currentTimeMillis();
-                startDetection();
-            } else if (!className.equals(currentActivity)) {
-                // 同一应用内Activity切换
-                Log.d(TAG, "Activity切换: " + currentActivity + " -> " + className);
+                detectCount = 0;
+                hasClicked = false;
                 
-                // 如果已经点击过跳过按钮，停止检测
-                if (hasClicked) {
-                    Log.d(TAG, "已点击跳过按钮，停止检测");
-                    stopDetection();
-                } else {
-                    // 检查是否还在广告检测窗口内
-                    long elapsed = System.currentTimeMillis() - appLaunchTime;
-                    if (elapsed > AD_DETECT_WINDOW) {
-                        Log.d(TAG, "超过检测窗口，停止检测");
-                        stopDetection();
-                    } else {
-                        // 继续检测
-                        currentActivity = className;
-                    }
-                }
+                // 开始检测
+                startDetection();
             }
         }
-    }
-    
-    private void resetDetection() {
-        currentActivity = "";
-        detectCount = 0;
-        hasClicked = false;
-        stopDetection();
     }
     
     private void startDetection() {
@@ -155,7 +140,6 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         
         long elapsed = System.currentTimeMillis() - appLaunchTime;
         if (elapsed > AD_DETECT_WINDOW) {
-            Log.d(TAG, "超过检测窗口，不启动检测");
             return;
         }
         
@@ -173,13 +157,13 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         
         long elapsed = System.currentTimeMillis() - appLaunchTime;
         if (elapsed > AD_DETECT_WINDOW) {
-            Log.d(TAG, "超过检测窗口，停止检测");
+            Log.d(TAG, "超过检测窗口");
             stopDetection();
             return;
         }
         
         if (detectCount >= MAX_DETECT_COUNT) {
-            Log.d(TAG, "达到最大检测次数，停止检测");
+            Log.d(TAG, "达到最大检测次数");
             stopDetection();
             return;
         }
@@ -198,7 +182,7 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         screenWidth = screenBounds.width();
         screenHeight = screenBounds.height();
         
-        // 查找最佳跳过按钮候选
+        // 查找跳过按钮
         AccessibilityNodeInfo skipButton = findBestSkipButton(root);
         
         if (skipButton != null) {
@@ -210,30 +194,22 @@ public class SkipAdAccessibilityService extends AccessibilityService {
                 saveSkipCount();
                 Log.d(TAG, "点击成功，总次数: " + skipCount);
                 stopDetection();
-            } else {
-                scheduleNextDetection();
+                return;
             }
-        } else {
-            scheduleNextDetection();
         }
         
         root.recycle();
+        scheduleNextDetection();
     }
     
     private void scheduleNextDetection() {
         if (!isDetecting || hasClicked) return;
         
-        long elapsed = System.currentTimeMillis() - appLaunchTime;
-        if (elapsed > AD_DETECT_WINDOW) {
-            stopDetection();
-            return;
-        }
-        
         handler.postDelayed(this::detectSkipButton, DETECT_INTERVAL);
     }
     
     /**
-     * 查找最佳跳过按钮（更严格的评分）
+     * 查找最佳跳过按钮
      */
     private AccessibilityNodeInfo findBestSkipButton(AccessibilityNodeInfo root) {
         List<ScoredNode> candidates = new ArrayList<>();
@@ -247,11 +223,12 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         // 按评分排序
         Collections.sort(candidates, (a, b) -> Integer.compare(b.score, a.score));
         
-        Log.d(TAG, "候选数量: " + candidates.size() + ", 最高分: " + candidates.get(0).score);
+        ScoredNode best = candidates.get(0);
+        Log.d(TAG, "候选: " + candidates.size() + "个, 最高分: " + best.score + ", " + describeNode(best.node));
         
-        // 评分必须 ≥ 60 才认为是跳过按钮（更严格）
-        if (candidates.get(0).score >= 60) {
-            return candidates.get(0).node;
+        // 评分达到阈值才返回
+        if (best.score >= MIN_SCORE_THRESHOLD) {
+            return best.node;
         }
         
         return null;
@@ -262,10 +239,12 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         
         int score = calculateScore(node);
         
-        if (score >= 40) {
+        // 收集评分超过30的候选
+        if (score >= 30) {
             candidates.add(new ScoredNode(node, score));
         }
         
+        // 递归检查子节点
         int childCount = node.getChildCount();
         for (int i = 0; i < childCount; i++) {
             AccessibilityNodeInfo child = node.getChild(i);
@@ -276,16 +255,16 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     }
     
     /**
-     * 计算节点作为跳过按钮的评分（更严格）
+     * 计算节点评分
      * 
-     * 评分因素：
-     * - 文本完全匹配 (+50)
-     * - ID包含skip/close (+30)
-     * - 位置在右上角/右下角 (+25)
-     * - 尺寸很小 (+15)
-     * - 可点击 (+10)
-     * 
-     * 总分需要 ≥ 60 才被认为是跳过按钮
+     * 评分规则：
+     * - 尺寸合适: +10
+     * - 位置在右上角/右下角: +20
+     * - 文本匹配: +30~50
+     * - ID匹配: +25
+     * - 内容描述匹配: +25
+     * - 可点击: +5
+     * - 倒计时模式: +20
      */
     private int calculateScore(AccessibilityNodeInfo node) {
         int score = 0;
@@ -295,52 +274,57 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         int width = bounds.width();
         int height = bounds.height();
         
-        // 1. 尺寸检查（更严格）
-        if (width < MIN_BUTTON_SIZE || width > MAX_BUTTON_SIZE ||
-            height < MIN_BUTTON_SIZE || height > MAX_BUTTON_SIZE) {
-            return 0;
-        }
-        score += 15;
+        // 转换为dp
+        int widthDp = (int) (width / density);
+        int heightDp = (int) (height / density);
         
-        // 2. 位置评分（必须在右上角或右下角）
+        // 1. 尺寸检查
+        if (widthDp < MIN_BUTTON_SIZE_DP || widthDp > MAX_BUTTON_SIZE_DP ||
+            heightDp < MIN_BUTTON_SIZE_DP || heightDp > MAX_BUTTON_SIZE_DP) {
+            return 0; // 尺寸不符合，直接排除
+        }
+        score += 10;
+        
+        // 2. 位置评分
         boolean isRightSide = bounds.right > screenWidth * RIGHT_THRESHOLD;
         boolean isTopArea = bounds.top < screenHeight * TOP_THRESHOLD;
         boolean isBottomArea = bounds.bottom > screenHeight * BOTTOM_THRESHOLD;
         
-        if (!isRightSide) {
-            return 0; // 必须在右侧
+        if (isRightSide && (isTopArea || isBottomArea)) {
+            score += 20;
+        } else if (isRightSide) {
+            score += 10;
+        } else if (isTopArea || isBottomArea) {
+            score += 5;
         }
         
-        if (isTopArea || isBottomArea) {
-            score += 25;
-        } else {
-            return 0; // 必须在顶部或底部
-        }
-        
-        // 3. 文本评分（更严格）
+        // 3. 文本评分
         CharSequence textSeq = node.getText();
         if (textSeq != null) {
-            String text = textSeq.toString().trim().toLowerCase();
-            if (text.length() <= 12) { // 短文本
+            String text = textSeq.toString().trim();
+            String lowerText = text.toLowerCase();
+            
+            // 完全匹配
+            for (String skipText : SKIP_TEXTS) {
+                if (text.equals(skipText) || lowerText.equals(skipText.toLowerCase())) {
+                    score += 50;
+                    break;
+                }
+            }
+            
+            // 包含匹配
+            if (score < 50) {
                 for (String skipText : SKIP_TEXTS) {
-                    if (text.equals(skipText.toLowerCase())) {
-                        score += 50; // 完全匹配
+                    if (lowerText.contains(skipText.toLowerCase())) {
+                        score += 30;
                         break;
                     }
                 }
-                // 包含匹配（分数较低）
-                if (score < 50) {
-                    for (String skipText : SKIP_TEXTS) {
-                        if (text.contains(skipText.toLowerCase())) {
-                            score += 30;
-                            break;
-                        }
-                    }
-                }
-                // 倒计时模式
-                if (text.matches(".*\\d+.*[秒s].*") || text.matches(".*倒计时.*")) {
-                    score += 35;
-                }
+            }
+            
+            // 倒计时模式
+            if (text.matches(".*\\d+.*[秒s].*") || text.contains("倒计时")) {
+                score += 20;
             }
         }
         
@@ -349,10 +333,6 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         if (descSeq != null) {
             String desc = descSeq.toString().trim().toLowerCase();
             for (String skipText : SKIP_TEXTS) {
-                if (desc.equals(skipText.toLowerCase())) {
-                    score += 45;
-                    break;
-                }
                 if (desc.contains(skipText.toLowerCase())) {
                     score += 25;
                     break;
@@ -366,7 +346,7 @@ public class SkipAdAccessibilityService extends AccessibilityService {
             String lowerId = id.toLowerCase();
             for (String skipId : SKIP_IDS) {
                 if (lowerId.contains(skipId)) {
-                    score += 30;
+                    score += 25;
                     break;
                 }
             }
@@ -374,7 +354,7 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         
         // 6. 可点击评分
         if (node.isClickable()) {
-            score += 10;
+            score += 5;
         }
         
         return score;
@@ -385,18 +365,20 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         sb.append("[");
         
         if (node.getText() != null) {
-            sb.append("text:").append(node.getText());
+            sb.append("text='").append(node.getText()).append("'");
         }
         if (node.getContentDescription() != null) {
-            sb.append(" desc:").append(node.getContentDescription());
+            sb.append(" desc='").append(node.getContentDescription()).append("'");
         }
         if (node.getViewIdResourceName() != null) {
-            sb.append(" id:").append(node.getViewIdResourceName());
+            sb.append(" id='").append(node.getViewIdResourceName()).append("'");
         }
         
         Rect bounds = new Rect();
         node.getBoundsInScreen(bounds);
-        sb.append(" pos:").append(bounds.toShortString());
+        int widthDp = (int) (bounds.width() / density);
+        int heightDp = (int) (bounds.height() / density);
+        sb.append(" size=").append(widthDp).append("x").append(heightDp).append("dp");
         
         sb.append("]");
         return sb.toString();
@@ -419,6 +401,7 @@ public class SkipAdAccessibilityService extends AccessibilityService {
             return false;
         }
         
+        // 尝试直接点击
         if (node.isClickable()) {
             boolean success = node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
             if (success) {
@@ -427,22 +410,23 @@ public class SkipAdAccessibilityService extends AccessibilityService {
             }
         }
         
+        // 尝试点击父节点
         AccessibilityNodeInfo parent = node.getParent();
         while (parent != null) {
             if (parent.isClickable()) {
                 boolean success = parent.performAction(AccessibilityNodeInfo.ACTION_CLICK);
-                parent.recycle();
                 if (success) {
                     lastClickTime = now;
+                    parent.recycle();
                     return true;
                 }
-                break;
             }
             AccessibilityNodeInfo grandParent = parent.getParent();
             parent.recycle();
             parent = grandParent;
         }
         
+        // 手势点击
         Rect bounds = new Rect();
         node.getBoundsInScreen(bounds);
         return performGestureClick(bounds.exactCenterX(), bounds.exactCenterY());
@@ -457,7 +441,11 @@ public class SkipAdAccessibilityService extends AccessibilityService {
         GestureDescription.Builder builder = new GestureDescription.Builder();
         builder.addStroke(new GestureDescription.StrokeDescription(path, 0, 50));
         
-        return dispatchGesture(builder.build(), null, null);
+        boolean result = dispatchGesture(builder.build(), null, null);
+        if (result) {
+            lastClickTime = System.currentTimeMillis();
+        }
+        return result;
     }
 
     @Override
@@ -493,8 +481,8 @@ public class SkipAdAccessibilityService extends AccessibilityService {
     }
     
     private static class ScoredNode {
-        AccessibilityNodeInfo node;
-        int score;
+        final AccessibilityNodeInfo node;
+        final int score;
         
         ScoredNode(AccessibilityNodeInfo node, int score) {
             this.node = node;
